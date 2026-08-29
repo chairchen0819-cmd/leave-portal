@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<!--
+  EMP-PORTAL 員工特休自助查詢 — LIFF 前端（Phase I-P3）
+
+  用途：員工從選單開啟本頁 → liff.init → 取登入憑證 → 向後端查本人特休四欄；
+        尚未配對者顯示配對表單，配對成功後自動重查。
+
+  部署前必做（唯一需要修改的地方＝下方 CONFIG 兩個常數）：
+    1. CONFIG.LIFF_ID  ← LINE Developers 主控台上的 LIFF ID
+    2. CONFIG.GAS_URL  ← Apps Script 部署後的 /exec 網址
+    交付檔內一律為 REPLACE_ME_ 佔位值，不含任何真實識別值。
+
+  四欄標籤與單位（I-P3.5，2026-08-23）：
+    應給時數／已休時數／未休時數＝小時，折算工資（上年度結算）＝元；
+    「上年度結算」語意＝最近一次已終結年度之結算金額。JSON key 名不變（entitled／used／remaining／payout）。
+    員工代號輸入提示為泛例「例：A123」——僅示意樣態（1 碼大寫字母＋3 碼數字），非任何真實代號；
+    本頁不做代號格式判斷（格式一律交後端核對，防前端洩漏名冊規則），故不設 pattern 屬性。
+
+  安全與相依：
+    - 除固定版 LIFF SDK 外零外部資源；無分析工具、無第三方腳本，登入憑證與特休數字不外送。
+    - 所有使用者可見的錯誤文字一律來自 errors.json（經 app_logic.js 的映射函式），
+      本檔內嵌指令碼中不得出現任何中文字串常值（由 run_front_tests.js 靜態掃描把關）。
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>特休查詢</title>
+<style>
+  /* 手機優先：單欄、大字、按鈕高度足夠單手點按 */
+  :root {
+    --bg: #f4f6f8;
+    --card: #ffffff;
+    --line: #dfe4ea;
+    --text: #1f2d3d;
+    --sub: #5c6b7a;
+    --accent: #2f6f4f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 16px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Noto Sans TC", "Microsoft JhengHei", system-ui, sans-serif;
+    font-size: 17px;
+    line-height: 1.6;
+  }
+  h1 { font-size: 20px; margin: 4px 0 16px; }
+  h2 { font-size: 18px; margin: 0 0 12px; }
+  .cards { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px 14px;
+  }
+  .card dt { font-size: 15px; color: var(--sub); margin: 0 0 6px; }
+  .card dd { margin: 0; font-size: 26px; font-weight: 700; }
+  .unit { font-size: 14px; font-weight: 400; color: var(--sub); margin-left: 4px; }
+  .hint { color: var(--sub); font-size: 15px; }
+  form { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  label { display: block; margin: 10px 0 4px; font-size: 15px; color: var(--sub); }
+  input {
+    width: 100%;
+    padding: 12px;
+    font-size: 17px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  button {
+    width: 100%;
+    min-height: 48px;
+    margin-top: 16px;
+    padding: 12px;
+    font-size: 17px;
+    color: #fff;
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button[disabled] { opacity: 0.5; }
+  #msgText { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>特休查詢</h1>
+
+  <!-- 載入中 -->
+  <p id="loading" class="hint">查詢中，請稍候…</p>
+
+  <!-- 查詢結果：四欄 -->
+  <section id="dataView" hidden>
+    <dl class="cards">
+      <div class="card"><dt>應給時數</dt><dd><span id="valEntitled">—</span><span class="unit">小時</span></dd></div>
+      <div class="card"><dt>已休時數</dt><dd><span id="valUsed">—</span><span class="unit">小時</span></dd></div>
+      <div class="card"><dt>未休時數</dt><dd><span id="valRemaining">—</span><span class="unit">小時</span></dd></div>
+      <div class="card"><dt>折算工資（上年度結算）</dt><dd><span id="valPayout">—</span><span class="unit">元</span></dd></div>
+    </dl>
+    <p class="hint">數字為人資最近一次上傳的結果，如與您的紀錄不同，請洽人資核對。</p>
+    <button id="btnReload" type="button">重新查詢</button>
+  </section>
+
+  <!-- 首次配對表單 -->
+  <section id="bindView" hidden>
+    <h2>首次使用：完成配對</h2>
+    <p id="bindHint" class="hint"></p>
+    <form id="bindForm" autocomplete="off">
+      <label for="empId">員工代號</label>
+      <input id="empId" name="empId" type="text" required maxlength="20" placeholder="例：A123">
+      <label for="bindCode">核對碼</label>
+      <input id="bindCode" name="bindCode" type="text" required maxlength="20" placeholder="人資發給您的核對碼">
+      <button id="btnBind" type="submit">送出配對</button>
+    </form>
+  </section>
+
+  <!-- 訊息 -->
+  <section id="msgView" hidden>
+    <p id="msgText"></p>
+    <button id="btnRetry" type="button" hidden>重新查詢</button>
+  </section>
+
+  <!-- 靜態備援：文案表本身載入失敗時才顯示（此段為靜態文字，不由指令碼組字） -->
+  <p id="bootFail" class="hint" hidden>目前無法載入畫面所需的說明文字，查詢暫時無法進行。請關閉這一頁，稍後從選單重新開啟一次；若仍然一樣，請聯絡人資協助處理。</p>
+</main>
+
+<script src="https://static.line-scdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
+<script src="./app_logic.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ===== 組態（部署時替換；交付檔一律佔位值）=====
+  var CONFIG = { LIFF_ID: "2011206000-J63FCF6j", GAS_URL: "https://script.google.com/macros/s/AKfycbzfKkufy4Kk7YY6ACF24ndD2F9VTkcSrQZHu2CicLZhEy563268pKrgZ6uCaV8HFLei/exec" };
+
+  var L = window.EmpPortalLogic;
+  var ERRORS_PATH = './errors.json';
+  var state = { idToken: '', errorsTable: null };
+
+  /**
+   * 用途：取得元素。
+   * @param {string} id 元素 id。
+   * @return {Element} 元素物件。
+   */
+  function el(id) { return document.getElementById(id); }
+
+  /**
+   * 用途：切換四個區塊（載入中／四欄／配對表單／訊息）的顯示狀態，一次只亮一個。
+   * @param {string} name 'loading'|'data'|'bind'|'msg'|'none'
+   */
+  function showView(name) {
+    el('loading').hidden = (name !== 'loading');
+    el('dataView').hidden = (name !== 'data');
+    el('bindView').hidden = (name !== 'bind');
+    el('msgView').hidden = (name !== 'msg');
+  }
+
+  /**
+   * 用途：顯示訊息區塊。文字一律由 app_logic 的映射函式自 errors.json 取得，
+   *       本函式不接受任何字串常值（靜態掃描規則 A3）。
+   * @param {Object} decision decideView() 的決策物件。
+   */
+  function showMessage(decision) {
+    var text = L.composeMessage(state.errorsTable, decision);
+    el('msgText').textContent = text;
+    el('btnRetry').hidden = !decision.canRetryQuery;
+    // 文案表缺該鍵且無 fallback 時會取到空字串，此時改亮靜態備援段，不讓畫面一片空白
+    if (!text) { el('bootFail').hidden = false; }
+    showView('msg');
+  }
+
+  /**
+   * 用途：依決策物件渲染畫面（四欄／配對表單／訊息）。
+   * @param {Object} decision decideView() 的決策物件。
+   */
+  function render(decision) {
+    if (decision.view === 'DATA') {
+      el('valEntitled').textContent = decision.fields.entitled;
+      el('valUsed').textContent = decision.fields.used;
+      el('valRemaining').textContent = decision.fields.remaining;
+      el('valPayout').textContent = decision.fields.payout;
+      showView('data');
+      return;
+    }
+    if (decision.view === 'BIND_FORM') {
+      el('bindHint').textContent = L.composeMessage(state.errorsTable, decision);
+      el('btnBind').disabled = false;
+      showView('bind');
+      return;
+    }
+    showMessage(decision);
+  }
+
+  /**
+   * 用途：載入文案表（同目錄相對路徑，非外部資源）。失敗時顯示靜態備援段並中止流程。
+   * @return {Promise} 完成時 state.errorsTable 已就緒。
+   */
+  function loadErrors() {
+    return fetch(ERRORS_PATH, { cache: 'no-cache' })
+      .then(function (res) { return res.json(); })
+      .then(function (json) { state.errorsTable = json; });
+  }
+
+  /**
+   * 用途：初始化 LIFF。外部瀏覽器且未登入才導向登入；在應用程式內開啟時不呼叫登入。
+   * @return {Promise} 初始化完成。
+   */
+  function initLiff() {
+    // SDK 檔本身沒載成功（網路阻擋、CDN 不可達）時 liff 不存在，視同啟動失敗
+    if (typeof liff === 'undefined') { return Promise.reject('LIFF_INIT_FAILED'); }
+    return liff.init({ liffId: CONFIG.LIFF_ID }).then(function () {
+      if (!liff.isInClient() && !liff.isLoggedIn()) {
+        liff.login();
+        return new Promise(function () { });   // 導向登入頁，本次流程不再往下走
+      }
+      return null;
+    }).catch(function () {
+      return Promise.reject('LIFF_INIT_FAILED');
+    });
+  }
+
+  /**
+   * 用途：取得登入憑證；取不到即中止並回報對應狀況碼。
+   * @return {Promise<string>} 憑證字串。
+   */
+  function readIdToken() {
+    var value = null;
+    try {
+      value = liff.getIDToken();
+    } catch (readError) {
+      return Promise.reject('LIFF_NO_ID_TOKEN');   // 權限範圍未含登入資訊等情況會拋出
+    }
+    if (!value) { return Promise.reject('LIFF_NO_ID_TOKEN'); }
+    state.idToken = value;
+    return Promise.resolve(value);
+  }
+
+  /**
+   * 用途：以 text/plain 簡單請求 POST 後端（避開跨來源預檢）；
+   *       任何連線或解析失敗一律轉成前端狀況碼物件，交由決策函式處理。
+   * @param {string} action 'query' 或 'bind'。
+   * @param {Object} params 其餘參數。
+   * @return {Promise<Object>} 後端回應或前端狀況碼物件。
+   */
+  function postApi(action, params) {
+    return fetch(CONFIG.GAS_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: L.buildRequestBody(action, params)
+    }).then(function (res) {
+      return res.text();
+    }).then(function (text) {
+      try {
+        return JSON.parse(text);
+      } catch (parseError) {
+        return { ok: false, error: 'BAD_RESPONSE' };
+      }
+    }).catch(function () {
+      return { ok: false, error: 'NETWORK_FAILED' };
+    });
+  }
+
+  /**
+   * 用途：查詢本人特休並渲染結果。
+   * @return {Promise} 完成。
+   */
+  function query() {
+    showView('loading');
+    return postApi('query', { idToken: state.idToken }).then(function (resp) {
+      render(L.decideView(resp, 'query', Date.now()));
+    });
+  }
+
+  /**
+   * 用途：送出配對；成功後直接重查，讓使用者馬上看到四欄。
+   * @param {Event} evt 表單送出事件。
+   */
+  function onBindSubmit(evt) {
+    evt.preventDefault();
+    var input = L.normalizeBindInput(el('empId').value, el('bindCode').value);
+    el('btnBind').disabled = true;
+    postApi('bind', { idToken: state.idToken, empId: input.empId, bindCode: input.bindCode })
+      .then(function (resp) {
+        var decision = L.decideView(resp, 'bind', Date.now());
+        el('btnBind').disabled = false;
+        if (decision.view === 'BIND_DONE') {
+          el('bindCode').value = '';
+          query();
+          return;
+        }
+        render(decision);
+      });
+  }
+
+  /**
+   * 用途：流程進入點。文案表→LIFF→憑證→查詢，任一步失敗都轉成可讀訊息。
+   */
+  function start() {
+    el('btnReload').addEventListener('click', query);
+    el('btnRetry').addEventListener('click', query);
+    el('bindForm').addEventListener('submit', onBindSubmit);
+
+    loadErrors().then(initLiff).then(readIdToken).then(query).catch(function (reason) {
+      if (!state.errorsTable) {
+        // 文案表都沒載到，只能亮靜態備援段（此處不組任何文字）
+        showView('none');
+        el('bootFail').hidden = false;
+        return;
+      }
+      var code = (typeof reason === 'string') ? reason : 'UNKNOWN';
+      showMessage(L.decideView({ ok: false, error: code }, 'query', Date.now()));
+    });
+  }
+
+  start();
+}());
+</script>
+</body>
+</html>
