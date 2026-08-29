@@ -16,6 +16,17 @@
     員工代號輸入提示為泛例「例：A123」——僅示意樣態（1 碼大寫字母＋3 碼數字），非任何真實代號；
     本頁不做代號格式判斷（格式一律交後端核對，防前端洩漏名冊規則），故不設 pattern 屬性。
 
+  時間脈絡四項（v1.1，Chair 裁定 D-I7，出處＝真實使用者三問「這是哪一年度的」「什麼時候的資料」
+  「數字不對找誰」）：
+    ①頁頂「本年度特休期間：起～迄」——無進行中年度時顯示破折號；
+    ②折算工資卡片下方小字「＝{期間} 年度結算」——payout_period 為空時整行隱藏，
+      不顯示「＝ 年度結算」這種半截字；
+    ③頁尾「資料更新時間：YYYY/MM/DD HH:mm」——由 app_logic.js 的 formatSyncedAt 轉換，
+      無法解析時顯示破折號；
+    ④頁尾「數字有疑問請洽人資。」——固定靜態文字。
+    三個新資料值（period_start／period_end／payout_period）與 synced_at 皆隨 query 回傳，
+    契約為恰八鍵，見 work\p2\README_P2.md 的請求／回應契約表。
+
   安全與相依：
     - 除固定版 LIFF SDK 外零外部資源；無分析工具、無第三方腳本，登入憑證與特休數字不外送。
     - 所有使用者可見的錯誤文字一律來自 errors.json（經 app_logic.js 的映射函式），
@@ -60,6 +71,13 @@
   .card dd { margin: 0; font-size: 26px; font-weight: 700; }
   .unit { font-size: 14px; font-weight: 400; color: var(--sub); margin-left: 4px; }
   .hint { color: var(--sub); font-size: 15px; }
+  /* 頁頂期間行：比卡片標籤略小、顏色同次要文字，讓數字仍是視覺主角 */
+  .period { margin: 0 0 12px; color: var(--sub); font-size: 15px; }
+  /* 折算工資的年度註記：緊貼卡片下方的小字 */
+  .note { margin: 6px 0 0; color: var(--sub); font-size: 13px; }
+  /* 頁尾：與上方內容拉開距離並以細線分隔 */
+  .foot { margin-top: 20px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .foot p { margin: 4px 0; font-size: 14px; }
   form { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
   label { display: block; margin: 10px 0 4px; font-size: 15px; color: var(--sub); }
   input {
@@ -95,14 +113,21 @@
 
   <!-- 查詢結果：四欄 -->
   <section id="dataView" hidden>
+    <p id="periodLine" class="period">本年度特休期間：<span id="valPeriod">—</span></p>
     <dl class="cards">
       <div class="card"><dt>應給時數</dt><dd><span id="valEntitled">—</span><span class="unit">小時</span></dd></div>
       <div class="card"><dt>已休時數</dt><dd><span id="valUsed">—</span><span class="unit">小時</span></dd></div>
       <div class="card"><dt>未休時數</dt><dd><span id="valRemaining">—</span><span class="unit">小時</span></dd></div>
       <div class="card"><dt>折算工資（上年度結算）</dt><dd><span id="valPayout">—</span><span class="unit">元</span></dd></div>
     </dl>
+    <!-- 折算工資的年度註記：payout_period 為空時整行隱藏（見 render()） -->
+    <p id="payoutNote" class="note" hidden>＝<span id="valPayoutPeriod"></span> 年度結算</p>
     <p class="hint">數字為人資最近一次上傳的結果，如與您的紀錄不同，請洽人資核對。</p>
     <button id="btnReload" type="button">重新查詢</button>
+    <footer class="foot">
+      <p class="hint">資料更新時間：<span id="valSyncedAt">—</span></p>
+      <p class="hint">數字有疑問請洽人資。</p>
+    </footer>
   </section>
 
   <!-- 首次配對表單 -->
@@ -183,6 +208,13 @@
       el('valUsed').textContent = decision.fields.used;
       el('valRemaining').textContent = decision.fields.remaining;
       el('valPayout').textContent = decision.fields.payout;
+      // 頁頂期間行與頁尾更新時間：空值時 app_logic 已回破折號，此處不再判斷
+      el('valPeriod').textContent = decision.fields.period_text;
+      el('valSyncedAt').textContent = decision.fields.synced_at_text;
+      // 折算年度註記：沒有結算年度就整行隱藏，不留「＝ 年度結算」的半截字
+      var payoutPeriod = decision.fields.payout_period;
+      el('valPayoutPeriod').textContent = payoutPeriod;
+      el('payoutNote').hidden = (payoutPeriod === '');
       showView('data');
       return;
     }

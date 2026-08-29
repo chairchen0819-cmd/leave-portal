@@ -28,7 +28,7 @@
   // ===== 常數 =====
 
   /** 本檔版本；與 errors.json 的 schemaVersion 各自獨立。 */
-  var VERSION = 'P3-1.0.0';
+  var VERSION = 'P3-1.1.0';
 
   /** 未知狀況的 fallback 文案鍵。 */
   var FALLBACK_KEY = 'UNKNOWN';
@@ -61,14 +61,29 @@
     .concat([LOCKED_NO_TIME_KEY, FALLBACK_KEY]);
 
   /**
-   * 特休四欄（順序＝顯示順序；欄名逐字取自 work\p1\schema.json 的 leave 表）。
-   * 語意（I-P3.5）：entitled／used／remaining 為時數（小時），payout 為折算工資（元，上年度結算）；
+   * 特休查詢回傳之八個欄位（欄名逐字取自 work\p1\schema.json 的 leave 表，
+   * 與 work\p2\code.gs 的 LEAVE_DATA_FIELDS_ 為同一集合）。
+   * 語意（I-P3.5）：entitled／used／remaining 為時數（小時），payout 為折算工資（元）；
+   * 語意（v1.1／D-I7）：period_start／period_end 為本年度行使期間起迄（YYYY/MM/DD，
+   * 無進行中年度時為空字串）；payout_period 為折算所屬年度之行使期間（起～迄，無則空字串）；
+   * synced_at 為地端同步上雲的時間（ISO 8601 含 +08:00）。
    * 顯示用的標籤與單位文字一律放在 index.html 的靜態 HTML，本檔不得出現中文字串常值。
    */
-  var LEAVE_FIELDS = ['entitled', 'used', 'remaining', 'payout'];
+  var LEAVE_FIELDS = ['entitled', 'used', 'remaining', 'payout',
+    'period_start', 'period_end', 'payout_period', 'synced_at'];
 
-  /** 需要千分位的欄位（金額欄）。時數欄不加千分位。 */
+  /** 需要千分位的欄位（金額欄）。時數欄與日期欄不加千分位。 */
   var THOUSANDS_FIELDS = ['payout'];
+
+  /**
+   * 無值時的顯示佔位符（破折號 U+2014）。
+   * 這是**符號**不是文字，故不受「本檔不得出現中文字串常值」之限制；
+   * 之所以放在這裡而非 errors.json，是因為它屬於資料畫面的空值呈現，不是錯誤文案。
+   */
+  var EMPTY_MARK = '\u2014';   // U+2014 EM DASH
+
+  /** 期間起迄之連接符（全形波浪號 U+FF5E），與後端 payout_period 的連接符一致。 */
+  var PERIOD_JOINER = '\uFF5E'; // U+FF5E FULLWIDTH TILDE
 
   /** LOCKED 文案中的等待時刻佔位符（errors.json 內寫成 {RETRY_TIME}）。 */
   var PLACEHOLDER_RETRY_TIME = 'RETRY_TIME';
@@ -134,8 +149,44 @@
   }
 
   /**
-   * 用途：驗證並格式化查詢回傳的四欄資料。契約＝恰四鍵、值全字串（work\p2\code.gs handleQuery_）。
+   * 用途：把 synced_at（ISO 8601 含時區位移）轉成畫面上的「資料更新時間」顯示字串
+   *       YYYY/MM/DD HH:mm（固定台北時間，不看本機時區）。
+   *       非字串、空字串、無法解析者一律回破折號——寧可顯示「不知道」，
+   *       也不顯示一個看起來像時間、實際上是錯的值。
+   * @param {*} value synced_at 值。
+   * @return {string} 例 "2026/08/22 15:30"；無法解析時為 "—"。
+   */
+  function formatSyncedAt(value) {
+    if (typeof value !== 'string' || value.trim() === '') { return EMPTY_MARK; }
+    var ms = Date.parse(value.trim());
+    if (isNaN(ms)) { return EMPTY_MARK; }
+    // 重用既有的台北時刻格式化（產出 "YYYY-MM-DD HH:mm"），只把日期分隔符換成斜線；
+    // 時分之間的冒號不受影響（replace 對象只有連字號）。
+    return toTaipeiMinuteText(ms).split('-').join('/');
+  }
+
+  /**
+   * 用途：把行使期間起迄兩欄組成一行顯示字串「起～迄」。
+   *       兩欄**皆有值**才顯示範圍；任一為空（含只有半邊的異常資料）一律回破折號——
+   *       半個期間對使用者沒有意義，且會讓人誤以為期間到某日就結束。
+   * @param {*} start 起日字串。
+   * @param {*} end 迄日字串。
+   * @return {string} 例 "2025/03/01～2026/02/28"；無法組成時為 "—"。
+   */
+  function formatPeriod(start, end) {
+    var s = (typeof start === 'string') ? start.trim() : '';
+    var e = (typeof end === 'string') ? end.trim() : '';
+    if (s === '' || e === '') { return EMPTY_MARK; }
+    return s + PERIOD_JOINER + e;
+  }
+
+  /**
+   * 用途：驗證並格式化查詢回傳的八欄資料。契約＝恰八鍵、值全字串（work\p2\code.gs handleQuery_）。
    *       任一條件不符即視為異常回應，交由呼叫端顯示 BAD_RESPONSE，不硬湊畫面。
+   *       回傳的 fields 除八個原欄位外，另含兩個**顯示衍生值**：
+   *         period_text     ＝行使期間一行字（空值時為破折號）
+   *         synced_at_text  ＝資料更新時間顯示字（空值或無法解析時為破折號）
+   *       衍生值放這裡而不放 index.html，是為了讓「空值怎麼顯示」這條規則可被 G3 逐路徑驗證。
    * @param {*} data 後端 data 物件。
    * @return {{ok:boolean, fields:Object}} 格式化後的顯示值（payout 已加千分位）。
    */
@@ -151,6 +202,8 @@
         ? formatThousands(data[field])
         : data[field];
     }
+    fields.period_text = formatPeriod(fields.period_start, fields.period_end);
+    fields.synced_at_text = formatSyncedAt(fields.synced_at);
     return { ok: true, fields: fields };
   }
 
@@ -332,10 +385,14 @@
     VERSION: VERSION,
     FALLBACK_KEY: FALLBACK_KEY,
     LEAVE_FIELDS: LEAVE_FIELDS.slice(),
+    EMPTY_MARK: EMPTY_MARK,
+    PERIOD_JOINER: PERIOD_JOINER,
     PLACEHOLDER_RETRY_TIME: PLACEHOLDER_RETRY_TIME,
     messageKeys: messageKeys,
     formatThousands: formatThousands,
     formatRetryAfter: formatRetryAfter,
+    formatSyncedAt: formatSyncedAt,
+    formatPeriod: formatPeriod,
     formatLeaveData: formatLeaveData,
     mapErrorKey: mapErrorKey,
     lookupMessage: lookupMessage,
