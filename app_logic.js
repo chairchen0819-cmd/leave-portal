@@ -1,8 +1,12 @@
 /**
- * EMP-PORTAL 員工特休自助查詢 — 前端純函式核心（Phase I-P3）
+ * EMP-PORTAL 員工自助查詢 — 前端純函式核心（Phase I-P3；二期 Y-P3 擴充薪資／出勤）
  *
  * 用途：把「後端回應 → 畫面決策 → 文案鍵」這段邏輯抽成純函式，
  *       讓 Node 可在無瀏覽器、無網路的情況下逐路徑驗證（驗收錨點 GATE-G3）。
+ *
+ * 二期（Y-P3）加法式擴充，一期函式語義一字未改：
+ *   新增頁籤狀態機（特休／薪資單／出勤）、query_pay 回應之視圖組裝（零值過濾、
+ *   出勤過濾與後綴、月份選單）與 NO_DATA 路徑；一期 query／bind 決策路徑完全沿用。
  *
  * 設計原則（與 index.html 的分工）：
  *   1. 本檔零 DOM、零網路、零計時器；所有 I/O（fetch、liff、document）只留在 index.html 包裝層。
@@ -28,12 +32,15 @@
   // ===== 常數 =====
 
   /** 本檔版本；與 errors.json 的 schemaVersion 各自獨立。 */
-  var VERSION = 'P3-1.1.0';
+  var VERSION = 'Y3-1.0.0';
 
   /** 未知狀況的 fallback 文案鍵。 */
   var FALLBACK_KEY = 'UNKNOWN';
 
-  /** 後端錯誤碼全集：逐字取自 work\p2\code.gs 的 ERR_（實測對照，非推測）。 */
+  /**
+   * 後端錯誤碼全集：逐字取自 work\p2\code.gs 的 ERR_（實測對照，非推測）。
+   * 一期七碼＋二期第八碼 NO_DATA（查無該月薪資資料，Y-P2 新增）。
+   */
   var BACKEND_CODES = [
     'INVALID_TOKEN',
     'NOT_BOUND',
@@ -41,7 +48,8 @@
     'BIND_FAILED',
     'LOCKED',
     'UNAUTHORIZED',
-    'SERVER_ERROR'
+    'SERVER_ERROR',
+    'NO_DATA'
   ];
 
   /** 前端自產狀況碼（後端不會回這些；由 index.html 包裝層在對應失敗點產生）。 */
@@ -90,6 +98,48 @@
 
   /** 台北時區位移（毫秒）。後端 toIsoTaipei_ 亦採固定 +08:00，不依賴執行環境時區。 */
   var TAIPEI_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+  // ===== 二期（Y-P3）常數 =====
+  //
+  // 頁籤代號一律為 ASCII 識別字；頁籤上的中文標籤與所有可見文字只存在於 index.html
+  // 靜態 HTML 或 errors.json（本檔不得出現中文字串常值，由 a1 靜態掃描把關）。
+
+  /** 頁籤代號：特休（一期畫面）／薪資單／出勤。 */
+  var TAB_LEAVE = 'leave';
+  var TAB_PAY = 'pay';
+  var TAB_ATTEND = 'attend';
+
+  /** 頁籤順序＝畫面上的左至右順序；第一個即預設頁籤。 */
+  var TABS = [TAB_LEAVE, TAB_PAY, TAB_ATTEND];
+
+  /**
+   * query_pay 成功回應之 data 鍵集合（恰五鍵）。
+   * 逐字取自 work\p2\code.gs 的 buildPayView_ 回傳（實測對照，非推測）。
+   */
+  var PAY_DATA_KEYS = ['months', 'month', 'companies', 'net_total', 'attend'];
+
+  /**
+   * 逐對資料的對數：pay 21（24 欄去 emp_id／month／company）、attend 23（25 欄去 emp_id／month）。
+   * 數字派生自 work_pay\y1\schema_pay.json 之欄數，由檢核腳本與該正本交叉比對（禁手抄漂移）。
+   */
+  var PAY_ITEM_COUNT = 21;
+  var ATTEND_ITEM_COUNT = 23;
+
+  /** 薪資明細的零值判定值：後端金額一律整數字串，值恰為此者即該項無發放。 */
+  var PAY_ZERO_TEXT = '0';
+
+  /**
+   * 金額字串樣態（可選負號＋整數）。**一律以 [0-9] 明寫、禁用 \d**——
+   * Y-P1 實測教訓：\d 在部分執行環境會收下全形數字，令 numeric-string 契約被穿透。
+   */
+  var AMOUNT_TEXT_PATTERN = /^-?[0-9]+$/;
+
+  /** 出勤時數值樣態（HH:MM，時可為 1~3 位）。同樣禁用 \d。 */
+  var HOURS_TEXT_PATTERN = /^[0-9]{1,3}:[0-9]{2}$/;
+
+  /** errors.json 中薪資／出勤顯示設定的區塊名稱與必填字串欄位。 */
+  var PAY_CONFIG_KEY = 'payView';
+  var PAY_CONFIG_FIELDS = ['rateField', 'countMarker', 'unitRate', 'unitCount', 'unitHours'];
 
   // ===== 顯示層格式化（純函式）=====
 
@@ -335,6 +385,307 @@
     return messageView('BAD_RESPONSE', { canRetryQuery: true });
   }
 
+  // ===== 二期（Y-P3）頁籤狀態機（純函式；不碰 DOM、不做任何初始化）=====
+
+  /**
+   * 用途：把外來的頁籤狀態正規化為合法值，避免壞狀態擴散（未知頁籤一律回到特休頁）。
+   * @param {*} state 頁籤狀態物件。
+   * @return {{active:string, payLoaded:boolean}} 正規化後的狀態。
+   */
+  function normalizeTabState(state) {
+    var raw = (state && typeof state === 'object' && !Array.isArray(state)) ? state : {};
+    var active = (typeof raw.active === 'string' && TABS.indexOf(raw.active) >= 0) ? raw.active : TABS[0];
+    return { active: active, payLoaded: raw.payLoaded === true };
+  }
+
+  /**
+   * 用途：建立頁籤初始狀態——預設停在特休頁（一期畫面），薪資資料尚未載入。
+   * @return {{active:string, payLoaded:boolean}} 初始狀態。
+   */
+  function createTabState() {
+    return { active: TABS[0], payLoaded: false };
+  }
+
+  /**
+   * 用途：判斷某頁籤是否吃 query_pay 的資料（薪資單與出勤共用同一次查詢結果）。
+   * @param {string} tab 頁籤代號。
+   * @return {boolean} 是否為薪資／出勤頁。
+   */
+  function isPayTab(tab) {
+    return tab === TAB_PAY || tab === TAB_ATTEND;
+  }
+
+  /**
+   * 用途：切換頁籤。回傳**新的**狀態物件（不改動傳入者）與兩個旗標：
+   *       changed＝畫面是否需要重繪；needsPayQuery＝是否需要發出 query_pay。
+   *       切換本身**不觸發任何初始化**——LIFF 初始化與登入憑證只在頁面啟動時做一次，
+   *       薪資與出勤兩頁共用同一份查詢結果，故僅在尚未載入時才需要查詢。
+   * @param {Object} state 目前狀態。
+   * @param {string} target 目標頁籤代號。
+   * @return {{state:Object, changed:boolean, needsPayQuery:boolean}} 切換結果。
+   */
+  function selectTab(state, target) {
+    var current = normalizeTabState(state);
+    if (typeof target !== 'string' || TABS.indexOf(target) < 0) {
+      // 未知頁籤：忽略，畫面維持原狀（不清空、不重查）
+      return { state: current, changed: false, needsPayQuery: false };
+    }
+    return {
+      state: { active: target, payLoaded: current.payLoaded },
+      changed: target !== current.active,
+      needsPayQuery: isPayTab(target) && !current.payLoaded
+    };
+  }
+
+  /**
+   * 用途：記錄薪資資料是否已載入（查詢成功才標記，失敗保持未載入以便下次切換時重試）。
+   * @param {Object} state 目前狀態。
+   * @param {boolean} loaded 是否已載入。
+   * @return {{active:string, payLoaded:boolean}} 新狀態。
+   */
+  function markPayLoaded(state, loaded) {
+    var current = normalizeTabState(state);
+    return { active: current.active, payLoaded: loaded === true };
+  }
+
+  // ===== 二期（Y-P3）薪資／出勤視圖組裝（純函式）=====
+
+  /**
+   * 用途：判斷月份陣列是否符合契約——非空、全為非空字串、嚴格降冪（隱含無重複）。
+   * @param {*} months 月份陣列。
+   * @return {boolean} 是否合格。
+   */
+  function isMonthsDesc(months) {
+    if (!Array.isArray(months) || months.length === 0) { return false; }
+    for (var i = 0; i < months.length; i++) {
+      if (typeof months[i] !== 'string' || months[i] === '') { return false; }
+      if (i > 0 && !(months[i - 1] > months[i])) { return false; }
+    }
+    return true;
+  }
+
+  /**
+   * 用途：組月份選單資料。順序照後端 months 原序（降冪），不重新排序、不改寫顯示格式。
+   * @param {Array<string>} months 可查月份。
+   * @param {string} month 目前所在月份。
+   * @return {Array<{month:string, selected:boolean}>} 選單項目。
+   */
+  function buildMonthOptions(months, month) {
+    var out = [];
+    if (!Array.isArray(months)) { return out; }
+    for (var i = 0; i < months.length; i++) {
+      out.push({ month: months[i], selected: months[i] === month });
+    }
+    return out;
+  }
+
+  /**
+   * 用途：決定要送給後端的月份——想查的月在可查清單內就用它，否則退回最新月（months[0]）；
+   *       清單為空時回空字串（＝不指定月份，由後端取最新月）。
+   * @param {Array<string>} months 可查月份。
+   * @param {*} wanted 想查的月份。
+   * @return {string} 要送出的月份。
+   */
+  function pickMonth(months, wanted) {
+    if (!Array.isArray(months) || months.length === 0) { return ''; }
+    return months.indexOf(wanted) >= 0 ? wanted : months[0];
+  }
+
+  /**
+   * 用途：自文案表取出薪資／出勤的顯示設定（恆顯欄名、後綴單位等）。
+   *       這些值必須是**資料**而非程式常數——欄名與單位屬使用者可見文字，
+   *       集中在 errors.json 才能改字不動程式，也才不會違反「本檔零中文字串常值」。
+   * @param {Object} table errors.json 解析後的物件。
+   * @return {{ok:boolean, config:Object}} 設定與是否可用。
+   */
+  function readPayConfig(table) {
+    var raw = (table && typeof table === 'object') ? table[PAY_CONFIG_KEY] : null;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { return { ok: false, config: null }; }
+    var config = {};
+    for (var i = 0; i < PAY_CONFIG_FIELDS.length; i++) {
+      var name = PAY_CONFIG_FIELDS[i];
+      if (typeof raw[name] !== 'string' || raw[name] === '') { return { ok: false, config: null }; }
+      config[name] = raw[name];
+    }
+    if (!Array.isArray(raw.alwaysShowFields) || raw.alwaysShowFields.length === 0) {
+      return { ok: false, config: null };
+    }
+    var always = [];
+    for (var j = 0; j < raw.alwaysShowFields.length; j++) {
+      if (typeof raw.alwaysShowFields[j] !== 'string' || raw.alwaysShowFields[j] === '') {
+        return { ok: false, config: null };
+      }
+      always.push(raw.alwaysShowFields[j]);
+    }
+    config.alwaysShowFields = always;
+    return { ok: true, config: config };
+  }
+
+  /**
+   * 用途：驗證並攤平 [[欄名, 值], ...] 逐對陣列。對數不符、非兩元素、非字串一律判不合格——
+   *       契約全等，寧可整頁不顯示，也不顯示半套明細（沿一期八鍵全等之精神）。
+   * @param {*} items 逐對陣列。
+   * @param {number} expectedCount 期望對數。
+   * @return {Array<{label:string, value:string}>|null} 攤平結果；不合格回 null。
+   */
+  function readItemPairs(items, expectedCount) {
+    if (!Array.isArray(items) || items.length !== expectedCount) { return null; }
+    var out = [];
+    for (var i = 0; i < items.length; i++) {
+      var pair = items[i];
+      if (!Array.isArray(pair) || pair.length !== 2) { return null; }
+      if (typeof pair[0] !== 'string' || pair[0] === '') { return null; }
+      if (typeof pair[1] !== 'string') { return null; }
+      out.push({ label: pair[0], value: pair[1] });
+    }
+    return out;
+  }
+
+  /**
+   * 用途：把各公司的 21 項明細組成卡片資料——值恰為 "0" 者隱藏（該項無發放），
+   *       其餘以千分位顯示；整張卡片全被隱藏時標記 empty，由畫面顯示「本月無發放明細」。
+   *       公司名稱與順序一律照後端給的，前端不寫死任何公司清單。
+   * @param {*} companies query_pay 回傳的 companies 陣列。
+   * @return {Array<{company:string, items:Array, empty:boolean}>|null} 卡片資料；不合格回 null。
+   */
+  function buildPayCards(companies) {
+    if (!Array.isArray(companies) || companies.length === 0) { return null; }
+    var cards = [];
+    for (var i = 0; i < companies.length; i++) {
+      var entry = companies[i];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) { return null; }
+      if (Object.keys(entry).length !== 2) { return null; }
+      if (typeof entry.company !== 'string' || entry.company === '') { return null; }
+      var pairs = readItemPairs(entry.items, PAY_ITEM_COUNT);
+      if (pairs === null) { return null; }
+      var visible = [];
+      for (var j = 0; j < pairs.length; j++) {
+        if (pairs[j].value === PAY_ZERO_TEXT) { continue; }
+        visible.push({ label: pairs[j].label, value: formatThousands(pairs[j].value) });
+      }
+      cards.push({ company: entry.company, items: visible, empty: visible.length === 0 });
+    }
+    return cards;
+  }
+
+  /**
+   * 用途：決定出勤某一項的後綴單位。判定順序＝出勤率→次數（欄名含「次」字者）→時數（值為 HH:MM）。
+   *       其餘（如日數欄）不加後綴——寧可不標單位，也不標一個錯的單位。
+   * @param {string} label 欄名。
+   * @param {string} value 值。
+   * @param {Object} config readPayConfig 的設定。
+   * @return {string} 後綴（可能為空字串）。
+   */
+  function attendUnit(label, value, config) {
+    if (label === config.rateField) { return config.unitRate; }
+    if (label.indexOf(config.countMarker) >= 0) { return config.unitCount; }
+    if (HOURS_TEXT_PATTERN.test(value)) { return config.unitHours; }
+    return '';
+  }
+
+  /**
+   * 用途：把出勤 23 項組成顯示列——空字串與 "0" 隱藏（該項無），
+   *       但設定中的恆顯欄（正工日、出勤率）不論值為何一律顯示；值一律原樣不換算。
+   *       attend 為 null（該月無出勤列）時回 empty，由畫面顯示「本月無出勤資料」。
+   * @param {*} attend query_pay 回傳的 attend（物件或 null）。
+   * @param {Object} config readPayConfig 的設定。
+   * @return {{ok:boolean, empty:boolean, items:Array}} 出勤視圖。
+   */
+  function buildAttendItems(attend, config) {
+    var fail = { ok: false, empty: true, items: [] };
+    if (attend === null) { return { ok: true, empty: true, items: [] }; }
+    if (!attend || typeof attend !== 'object' || Array.isArray(attend)) { return fail; }
+    if (Object.keys(attend).length !== 1) { return fail; }
+    var pairs = readItemPairs(attend.items, ATTEND_ITEM_COUNT);
+    if (pairs === null) { return fail; }
+    var visible = [];
+    for (var i = 0; i < pairs.length; i++) {
+      var label = pairs[i].label;
+      var value = pairs[i].value;
+      var always = config.alwaysShowFields.indexOf(label) >= 0;
+      if (!always && (value === '' || value === PAY_ZERO_TEXT)) { continue; }
+      visible.push({ label: label, value: value, unit: attendUnit(label, value, config) });
+    }
+    return { ok: true, empty: false, items: visible };
+  }
+
+  /**
+   * 用途：驗證並格式化 query_pay 的 data（恰五鍵、months 降冪、month 在清單內、
+   *       net_total 為整數字串、companies 與 attend 逐對合格）。任一條件不符即整筆判不合格，
+   *       由呼叫端顯示 BAD_RESPONSE，不硬湊畫面。
+   * @param {*} data query_pay 回傳的 data。
+   * @param {Object} config readPayConfig 的設定。
+   * @return {Object} {ok, months, month, monthOptions, cards, netTotalText, attend}。
+   */
+  function formatPayView(data, config) {
+    var fail = { ok: false };
+    if (!data || typeof data !== 'object' || Array.isArray(data)) { return fail; }
+    var keys = Object.keys(data);
+    if (keys.length !== PAY_DATA_KEYS.length) { return fail; }
+    for (var i = 0; i < PAY_DATA_KEYS.length; i++) {
+      if (keys.indexOf(PAY_DATA_KEYS[i]) < 0) { return fail; }
+    }
+    if (!isMonthsDesc(data.months)) { return fail; }
+    if (typeof data.month !== 'string' || data.months.indexOf(data.month) < 0) { return fail; }
+    if (typeof data.net_total !== 'string' || !AMOUNT_TEXT_PATTERN.test(data.net_total)) { return fail; }
+    var cards = buildPayCards(data.companies);
+    if (cards === null) { return fail; }
+    var attendView = buildAttendItems(data.attend, config);
+    if (!attendView.ok) { return fail; }
+    return {
+      ok: true,
+      months: data.months.slice(),
+      month: data.month,
+      monthOptions: buildMonthOptions(data.months, data.month),
+      cards: cards,
+      netTotalText: formatThousands(data.net_total),
+      attend: { empty: attendView.empty, items: attendView.items }
+    };
+  }
+
+  /**
+   * 用途：組出「薪資頁顯示訊息」型的決策物件（訊息顯示在薪資／出勤頁內，頁籤仍可切換）。
+   * @param {string} key 文案鍵。
+   * @param {boolean} canRetry 是否可按重新查詢。
+   * @return {Object} 決策物件。
+   */
+  function payMessageView(key, canRetry) {
+    return { view: 'PAY_MESSAGE', messageKey: key, vars: null, canRetryQuery: canRetry === true };
+  }
+
+  /**
+   * 用途：依 query_pay 回應決定薪資／出勤頁要顯示資料還是訊息。
+   *       錯誤路徑一律沿用一期 decideView 的映射（含未知碼落 fallback、LOCKED 時刻換算），
+   *       只把「訊息」的落點改到薪資頁內；NOT_BOUND 仍回傳 BIND_FORM——
+   *       配對表單只存在於特休頁，故由呼叫端切回特休頁完成配對，
+   *       不在沒有表單的薪資頁顯示「請在下方輸入…」這種做不到的指示。
+   * @param {*} resp 後端回應（或包裝層產生的 {ok:false,error:前端碼}）。
+   * @param {Object} table errors.json 解析後的物件（供讀取顯示設定）。
+   * @param {number} nowMs 目前時間毫秒。
+   * @return {Object} {view:'PAY_DATA'|'PAY_MESSAGE'|'BIND_FORM', messageKey, pay, canRetryQuery}
+   */
+  function decidePayView(resp, table, nowMs) {
+    var cfg = readPayConfig(table);
+    if (!cfg.ok) {
+      // 文案表缺少薪資顯示設定：畫面仍要有話可說，落 fallback 文案而非硬湊版面
+      return payMessageView(FALLBACK_KEY, false);
+    }
+    if (!resp || typeof resp !== 'object' || Array.isArray(resp)) {
+      return payMessageView('BAD_RESPONSE', true);
+    }
+    if (resp.ok === true) {
+      var view = formatPayView(resp.data, cfg.config);
+      if (!view.ok) { return payMessageView('BAD_RESPONSE', true); }
+      return { view: 'PAY_DATA', messageKey: null, vars: null, canRetryQuery: false, pay: view };
+    }
+    if (resp.ok === false) {
+      var base = decideView(resp, 'query', nowMs);
+      if (base.view === 'MESSAGE') { base.view = 'PAY_MESSAGE'; }
+      return base;
+    }
+    return payMessageView('BAD_RESPONSE', true);
+  }
+
   // ===== 請求組裝（純函式；不含任何網路呼叫）=====
 
   /**
@@ -388,6 +739,29 @@
     EMPTY_MARK: EMPTY_MARK,
     PERIOD_JOINER: PERIOD_JOINER,
     PLACEHOLDER_RETRY_TIME: PLACEHOLDER_RETRY_TIME,
+    // 二期（Y-P3）
+    TAB_LEAVE: TAB_LEAVE,
+    TAB_PAY: TAB_PAY,
+    TAB_ATTEND: TAB_ATTEND,
+    TABS: TABS.slice(),
+    PAY_DATA_KEYS: PAY_DATA_KEYS.slice(),
+    PAY_ITEM_COUNT: PAY_ITEM_COUNT,
+    ATTEND_ITEM_COUNT: ATTEND_ITEM_COUNT,
+    PAY_ZERO_TEXT: PAY_ZERO_TEXT,
+    PAY_CONFIG_KEY: PAY_CONFIG_KEY,
+    PAY_CONFIG_FIELDS: PAY_CONFIG_FIELDS.slice(),
+    createTabState: createTabState,
+    selectTab: selectTab,
+    markPayLoaded: markPayLoaded,
+    isPayTab: isPayTab,
+    isMonthsDesc: isMonthsDesc,
+    buildMonthOptions: buildMonthOptions,
+    pickMonth: pickMonth,
+    readPayConfig: readPayConfig,
+    buildPayCards: buildPayCards,
+    buildAttendItems: buildAttendItems,
+    formatPayView: formatPayView,
+    decidePayView: decidePayView,
     messageKeys: messageKeys,
     formatThousands: formatThousands,
     formatRetryAfter: formatRetryAfter,

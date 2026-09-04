@@ -1,9 +1,10 @@
 <!DOCTYPE html>
 <!--
-  EMP-PORTAL 員工特休自助查詢 — LIFF 前端（Phase I-P3）
+  EMP-PORTAL 員工自助查詢 — LIFF 前端（Phase I-P3；二期 Y-P3 擴充薪資單／出勤）
 
-  用途：員工從選單開啟本頁 → liff.init → 取登入憑證 → 向後端查本人特休四欄；
+  用途：員工從選單開啟本頁 → liff.init → 取登入憑證 → 向後端查本人資料；
         尚未配對者顯示配對表單，配對成功後自動重查。
+        畫面分三個頁籤：特休（一期功能，內容與文案未改）／薪資單／出勤。
 
   部署前必做（唯一需要修改的地方＝下方 CONFIG 兩個常數）：
     1. CONFIG.LIFF_ID  ← LINE Developers 主控台上的 LIFF ID
@@ -27,8 +28,20 @@
     三個新資料值（period_start／period_end／payout_period）與 synced_at 皆隨 query 回傳，
     契約為恰八鍵，見 work\p2\README_P2.md 的請求／回應契約表。
 
+  二期（Y-P3，2026-08-30）薪資單與出勤：
+    ①三頁籤共用同一次登入與同一份 query_pay 結果；切換頁籤**不重跑初始化、不重新查詢**，
+      只有換月份或按重新查詢才再發一次請求。
+    ②薪資單頁：月份鈕（後端 months 原序＝降冪，預設最新月）＋每家公司一張卡（公司名與順序
+      一律照後端給的，前端零寫死公司清單）＋最後一張實發合計卡；
+      卡內明細值恰為 "0" 者隱藏，整張都被隱藏時顯示「本月無發放明細」。
+    ③出勤頁：與薪資單共用月份；空字串與 "0" 的項目隱藏，但「正工日」「出勤率」恆顯示；
+      值一律原樣不換算，後綴單位由 errors.json 的 payView 設定決定。
+    ④薪資單／出勤頁尾顯示「資料月份」——這兩張表沒有 synced_at 欄，故不顯示資料更新時間，
+      不拿特休的同步時間冒充薪資的更新時間。
+    ⑤動態卡片一律以 <template> 複製後填值：可見文字留在靜態 HTML，指令碼只塞資料值。
+
   安全與相依：
-    - 除固定版 LIFF SDK 外零外部資源；無分析工具、無第三方腳本，登入憑證與特休數字不外送。
+    - 除固定版 LIFF SDK 外零外部資源；無分析工具、無第三方腳本，登入憑證與數字不外送。
     - 所有使用者可見的錯誤文字一律來自 errors.json（經 app_logic.js 的映射函式），
       本檔內嵌指令碼中不得出現任何中文字串常值（由 run_front_tests.js 靜態掃描把關）。
 -->
@@ -37,7 +50,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
-<title>特休查詢</title>
+<title>員工自助查詢</title>
 <style>
   /* 手機優先：單欄、大字、按鈕高度足夠單手點按 */
   :root {
@@ -101,56 +114,170 @@
   }
   button[disabled] { opacity: 0.5; }
   #msgText { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+  #payMsgText { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
   [hidden] { display: none !important; }
+
+  /* ===== 二期：頁籤列（三個等寬鈕，選中者以主色底反白）===== */
+  .tabs { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin: 0 0 16px; }
+  .tab {
+    width: 100%;
+    min-height: 44px;
+    margin: 0;
+    padding: 8px 4px;
+    font-size: 16px;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }
+  .tab.on { color: #fff; background: var(--accent); border-color: var(--accent); }
+  /* 月份鈕：橫向可捲，選中者反白 */
+  .months { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
+  .mbtn {
+    width: auto;
+    min-height: 40px;
+    margin: 0;
+    padding: 6px 14px;
+    font-size: 16px;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 999px;
+  }
+  .mbtn.on { color: #fff; background: var(--accent); border-color: var(--accent); }
+  /* 明細卡：標題＋提示小字＋逐列明細 */
+  .pcard {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px 14px;
+    margin: 0 0 12px;
+  }
+  .pcard h2 { margin: 0 0 2px; font-size: 17px; }
+  .prows { margin: 8px 0 0; }
+  .prow {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+    padding: 6px 0;
+    border-top: 1px solid var(--line);
+  }
+  .prow dt { color: var(--sub); font-size: 15px; margin: 0; }
+  .prow dd { margin: 0; font-size: 18px; font-weight: 700; text-align: right; }
+  .totalLine { margin: 0; font-size: 20px; font-weight: 700; }
 </style>
 </head>
 <body>
 <main>
-  <h1>特休查詢</h1>
+  <h1>員工自助查詢</h1>
 
-  <!-- 載入中 -->
-  <p id="loading" class="hint">查詢中，請稍候…</p>
+  <!-- 頁籤列：特休為一期畫面，薪資單與出勤共用同一次 query_pay 查詢 -->
+  <nav id="tabs" class="tabs">
+    <button id="tabBtnLeave" class="tab on" type="button" data-tab="leave">特休</button>
+    <!-- 薪資單／出勤兩鈕在取得登入憑證前為停用狀態：開頁瞬間就點會拿不到憑證，
+         畫面會冒出「登入資訊已經逾時」這種與事實不符的訊息 -->
+    <button id="tabBtnPay" class="tab" type="button" data-tab="pay" disabled>薪資單</button>
+    <button id="tabBtnAttend" class="tab" type="button" data-tab="attend" disabled>出勤</button>
+  </nav>
 
-  <!-- 查詢結果：四欄 -->
-  <section id="dataView" hidden>
-    <p id="periodLine" class="period">本年度特休期間：<span id="valPeriod">—</span></p>
-    <dl class="cards">
-      <div class="card"><dt>應給時數</dt><dd><span id="valEntitled">—</span><span class="unit">小時</span></dd></div>
-      <div class="card"><dt>已休時數</dt><dd><span id="valUsed">—</span><span class="unit">小時</span></dd></div>
-      <div class="card"><dt>未休時數</dt><dd><span id="valRemaining">—</span><span class="unit">小時</span></dd></div>
-      <div class="card"><dt>折算工資（上年度結算）</dt><dd><span id="valPayout">—</span><span class="unit">元</span></dd></div>
-    </dl>
-    <!-- 折算工資的年度註記：payout_period 為空時整行隱藏（見 render()） -->
-    <p id="payoutNote" class="note" hidden>＝<span id="valPayoutPeriod"></span> 年度結算</p>
-    <p class="hint">數字為人資最近一次上傳的結果，如與您的紀錄不同，請洽人資核對。</p>
-    <button id="btnReload" type="button">重新查詢</button>
-    <footer class="foot">
-      <p class="hint">資料更新時間：<span id="valSyncedAt">—</span></p>
-      <p class="hint">數字有疑問請洽人資。</p>
-    </footer>
+  <!-- 薪資單／出勤共用區：月份選擇、查詢中、訊息（特休頁不顯示） -->
+  <div id="payTop" hidden>
+    <div id="monthBar" class="months"></div>
+    <p id="payLoading" class="hint" hidden>查詢中，請稍候…</p>
+    <section id="payMsgView" hidden>
+      <p id="payMsgText"></p>
+      <button id="btnPayRetry" type="button" hidden>重新查詢</button>
+    </section>
+  </div>
+
+  <!-- ===== 頁籤一：特休（一期畫面，顯示內容與文案未更動）===== -->
+  <section id="tabLeave">
+    <!-- 載入中 -->
+    <p id="loading" class="hint">查詢中，請稍候…</p>
+
+    <!-- 查詢結果：四欄 -->
+    <section id="dataView" hidden>
+      <p id="periodLine" class="period">本年度特休期間：<span id="valPeriod">—</span></p>
+      <dl class="cards">
+        <div class="card"><dt>應給時數</dt><dd><span id="valEntitled">—</span><span class="unit">小時</span></dd></div>
+        <div class="card"><dt>已休時數</dt><dd><span id="valUsed">—</span><span class="unit">小時</span></dd></div>
+        <div class="card"><dt>未休時數</dt><dd><span id="valRemaining">—</span><span class="unit">小時</span></dd></div>
+        <div class="card"><dt>折算工資（上年度結算）</dt><dd><span id="valPayout">—</span><span class="unit">元</span></dd></div>
+      </dl>
+      <!-- 折算工資的年度註記：payout_period 為空時整行隱藏（見 render()） -->
+      <p id="payoutNote" class="note" hidden>＝<span id="valPayoutPeriod"></span> 年度結算</p>
+      <p class="hint">數字為人資最近一次上傳的結果，如與您的紀錄不同，請洽人資核對。</p>
+      <button id="btnReload" type="button">重新查詢</button>
+      <footer class="foot">
+        <p class="hint">資料更新時間：<span id="valSyncedAt">—</span></p>
+        <p class="hint">數字有疑問請洽人資。</p>
+      </footer>
+    </section>
+
+    <!-- 首次配對表單 -->
+    <section id="bindView" hidden>
+      <h2>首次使用：完成配對</h2>
+      <p id="bindHint" class="hint"></p>
+      <form id="bindForm" autocomplete="off">
+        <label for="empId">員工代號</label>
+        <input id="empId" name="empId" type="text" required maxlength="20" placeholder="例：A123">
+        <label for="bindCode">核對碼</label>
+        <input id="bindCode" name="bindCode" type="text" required maxlength="20" placeholder="人資發給您的核對碼">
+        <button id="btnBind" type="submit">送出配對</button>
+      </form>
+    </section>
+
+    <!-- 訊息 -->
+    <section id="msgView" hidden>
+      <p id="msgText"></p>
+      <button id="btnRetry" type="button" hidden>重新查詢</button>
+    </section>
   </section>
 
-  <!-- 首次配對表單 -->
-  <section id="bindView" hidden>
-    <h2>首次使用：完成配對</h2>
-    <p id="bindHint" class="hint"></p>
-    <form id="bindForm" autocomplete="off">
-      <label for="empId">員工代號</label>
-      <input id="empId" name="empId" type="text" required maxlength="20" placeholder="例：A123">
-      <label for="bindCode">核對碼</label>
-      <input id="bindCode" name="bindCode" type="text" required maxlength="20" placeholder="人資發給您的核對碼">
-      <button id="btnBind" type="submit">送出配對</button>
-    </form>
+  <!-- ===== 頁籤二：薪資單（每家公司一張卡＋合計卡，由 tplPayCard／tplTotalCard 複製產生）===== -->
+  <section id="tabPay" hidden>
+    <div id="payCards"></div>
   </section>
 
-  <!-- 訊息 -->
-  <section id="msgView" hidden>
-    <p id="msgText"></p>
-    <button id="btnRetry" type="button" hidden>重新查詢</button>
+  <!-- ===== 頁籤三：出勤（一張卡，列由 tplAttendRow 複製產生）===== -->
+  <section id="tabAttend" hidden>
+    <div id="attendCard" class="pcard">
+      <dl id="attendRows" class="prows"></dl>
+    </div>
+    <p id="attendEmpty" class="hint" hidden>本月無出勤資料</p>
   </section>
+
+  <!-- 薪資單／出勤共用頁尾：這兩張表沒有同步時間欄，故只顯示資料月份 -->
+  <footer id="payFoot" class="foot" hidden>
+    <p class="hint">資料月份：<span id="valPayMonth">—</span></p>
+    <p class="hint">數字有疑問請洽人資。</p>
+  </footer>
 
   <!-- 靜態備援：文案表本身載入失敗時才顯示（此段為靜態文字，不由指令碼組字） -->
   <p id="bootFail" class="hint" hidden>目前無法載入畫面所需的說明文字，查詢暫時無法進行。請關閉這一頁，稍後從選單重新開啟一次；若仍然一樣，請聯絡人資協助處理。</p>
+
+  <!-- ===== 動態卡片的靜態版型：可見文字只存在於這裡，指令碼只把資料值塞進 slot* ===== -->
+  <template id="tplPayCard">
+    <section class="pcard">
+      <h2 class="slotTitle"></h2>
+      <p class="note">本表僅列 <span class="slotCompany"></span> 發放部分</p>
+      <dl class="prows slotRows"></dl>
+      <p class="hint slotEmpty" hidden>本月無發放明細</p>
+    </section>
+  </template>
+  <template id="tplPayRow">
+    <div class="prow"><dt class="slotLabel"></dt><dd class="slotValue"></dd></div>
+  </template>
+  <template id="tplTotalCard">
+    <section class="pcard"><p class="totalLine">實發合計 <span class="slotTotal"></span> 元</p></section>
+  </template>
+  <template id="tplAttendRow">
+    <div class="prow"><dt class="slotLabel"></dt><dd><span class="slotValue"></span><span class="unit slotUnit"></span></dd></div>
+  </template>
+  <template id="tplMonthBtn">
+    <button class="mbtn" type="button"></button>
+  </template>
 </main>
 
 <script src="https://static.line-scdn.net/liff/edge/versions/2.22.3/sdk.js"></script>
@@ -164,7 +291,13 @@
 
   var L = window.EmpPortalLogic;
   var ERRORS_PATH = './errors.json';
-  var state = { idToken: '', errorsTable: null };
+  var state = {
+    idToken: '',
+    errorsTable: null,
+    tab: L.createTabState(),   // 頁籤狀態機的狀態由 app_logic 管理，本層只照結果切顯示
+    payMonths: [],
+    payMonth: ''
+  };
 
   /**
    * 用途：取得元素。
@@ -174,7 +307,32 @@
   function el(id) { return document.getElementById(id); }
 
   /**
-   * 用途：切換四個區塊（載入中／四欄／配對表單／訊息）的顯示狀態，一次只亮一個。
+   * 用途：取得版型節點內的資料槽（class 名以 slot 開頭者）。
+   * @param {Element} node 版型節點。
+   * @param {string} name 槽的 class 名。
+   * @return {Element} 槽元素。
+   */
+  function slot(node, name) { return node.querySelector('.' + name); }
+
+  /**
+   * 用途：清空節點的子元素（逐一移除，不以字串指派清空，避免繞過文字節點的旁路）。
+   * @param {Element} node 容器節點。
+   */
+  function clearNode(node) {
+    while (node.firstChild) { node.removeChild(node.firstChild); }
+  }
+
+  /**
+   * 用途：由靜態版型複製一份節點（可見文字留在 HTML，本層只填資料值）。
+   * @param {string} id 版型 id。
+   * @return {Element} 複製出的節點。
+   */
+  function fromTemplate(id) {
+    return el(id).content.firstElementChild.cloneNode(true);
+  }
+
+  /**
+   * 用途：切換特休頁內四個區塊（載入中／四欄／配對表單／訊息）的顯示狀態，一次只亮一個。
    * @param {string} name 'loading'|'data'|'bind'|'msg'|'none'
    */
   function showView(name) {
@@ -199,7 +357,7 @@
   }
 
   /**
-   * 用途：依決策物件渲染畫面（四欄／配對表單／訊息）。
+   * 用途：依決策物件渲染特休頁（四欄／配對表單／訊息）。
    * @param {Object} decision decideView() 的決策物件。
    */
   function render(decision) {
@@ -225,6 +383,178 @@
       return;
     }
     showMessage(decision);
+  }
+
+  // ===== 二期：頁籤切換（純顯示切換，不做任何初始化、不重查已載入的資料）=====
+
+  /**
+   * 用途：依目前頁籤狀態切換三個頁面與共用區塊的顯示，並更新頁籤鈕的選中樣式。
+   */
+  function renderTabs() {
+    var active = state.tab.active;
+    el('tabLeave').hidden = (active !== L.TAB_LEAVE);
+    el('tabPay').hidden = (active !== L.TAB_PAY);
+    el('tabAttend').hidden = (active !== L.TAB_ATTEND);
+    var onPayTab = L.isPayTab(active);
+    el('payTop').hidden = !onPayTab;
+    el('payFoot').hidden = !onPayTab;
+    var buttons = document.querySelectorAll('#tabs button');
+    for (var i = 0; i < buttons.length; i++) {
+      var isActive = (buttons[i].getAttribute('data-tab') === active);
+      buttons[i].className = isActive ? 'tab on' : 'tab';
+      if (isActive) {
+        buttons[i].setAttribute('aria-current', 'page');
+      } else {
+        buttons[i].removeAttribute('aria-current');
+      }
+    }
+  }
+
+  /**
+   * 用途：頁籤鈕點擊。只切顯示；僅在薪資資料尚未載入時才發出一次查詢，
+   *       不重跑 LIFF 初始化、不重取登入憑證、不重查已在畫面上的資料。
+   * @param {Event} evt 點擊事件。
+   */
+  function onTabClick(evt) {
+    var moved = L.selectTab(state.tab, evt.currentTarget.getAttribute('data-tab'));
+    state.tab = moved.state;
+    renderTabs();
+    if (moved.needsPayQuery) { queryPay(''); }
+  }
+
+  /**
+   * 用途：月份鈕點擊——換月份即重查一次（薪資與出勤同時換月，兩頁共用同一份結果）。
+   *       先把選中樣式移到剛按下的月份，讓使用者立刻知道自己按到了哪一個月；
+   *       查詢成功後會再依後端回傳的月份重畫一次（以後端為準）。
+   * @param {Event} evt 點擊事件。
+   */
+  function onMonthClick(evt) {
+    var wanted = L.pickMonth(state.payMonths, evt.currentTarget.getAttribute('data-month'));
+    renderMonthBar(L.buildMonthOptions(state.payMonths, wanted));
+    queryPay(wanted);
+  }
+
+  /**
+   * 用途：薪資頁的重新查詢——沿用目前月份重查。
+   */
+  function onPayRetry() { queryPay(state.payMonth); }
+
+  /**
+   * 用途：查詢中的畫面狀態（先收起舊內容與訊息，避免新舊資料並存造成誤讀）。
+   */
+  function showPayLoading() {
+    el('payLoading').hidden = false;
+    el('payMsgView').hidden = true;
+    el('payCards').hidden = true;
+    el('attendCard').hidden = true;
+    el('attendEmpty').hidden = true;
+  }
+
+  /**
+   * 用途：顯示薪資／出勤頁的訊息（NO_DATA 等）。文字一律來自文案表映射函式。
+   * @param {Object} decision decidePayView() 的決策物件。
+   */
+  function showPayMessage(decision) {
+    var text = L.composeMessage(state.errorsTable, decision);
+    el('payMsgText').textContent = text;
+    el('btnPayRetry').hidden = !decision.canRetryQuery;
+    if (!text) { el('bootFail').hidden = false; }
+    // 這次沒有取到任何一個月的資料，頁尾就不該繼續掛著上一次成功查詢的月份
+    el('valPayMonth').textContent = L.EMPTY_MARK;
+    el('payMsgView').hidden = false;
+    el('payCards').hidden = true;
+    el('attendCard').hidden = true;
+    el('attendEmpty').hidden = true;
+  }
+
+  /**
+   * 用途：畫月份鈕（順序照後端 months 原序＝降冪；目前月份反白）。
+   * @param {Array} options buildMonthOptions() 的結果。
+   */
+  function renderMonthBar(options) {
+    var bar = el('monthBar');
+    clearNode(bar);
+    for (var i = 0; i < options.length; i++) {
+      var button = fromTemplate('tplMonthBtn');
+      button.textContent = options[i].month;
+      button.className = options[i].selected ? 'mbtn on' : 'mbtn';
+      button.setAttribute('data-month', options[i].month);
+      button.addEventListener('click', onMonthClick);
+      bar.appendChild(button);
+    }
+  }
+
+  /**
+   * 用途：畫各公司明細卡與最後一張實發合計卡。公司名與順序完全照決策物件，本層不做任何排序或過濾。
+   * @param {Object} view decidePayView() 的 pay 視圖。
+   */
+  function renderPayCards(view) {
+    var host = el('payCards');
+    clearNode(host);
+    for (var i = 0; i < view.cards.length; i++) {
+      var card = view.cards[i];
+      var node = fromTemplate('tplPayCard');
+      slot(node, 'slotTitle').textContent = card.company;
+      slot(node, 'slotCompany').textContent = card.company;
+      slot(node, 'slotEmpty').hidden = !card.empty;
+      var rows = slot(node, 'slotRows');
+      for (var j = 0; j < card.items.length; j++) {
+        var row = fromTemplate('tplPayRow');
+        slot(row, 'slotLabel').textContent = card.items[j].label;
+        slot(row, 'slotValue').textContent = card.items[j].value;
+        rows.appendChild(row);
+      }
+      host.appendChild(node);
+    }
+    var total = fromTemplate('tplTotalCard');
+    slot(total, 'slotTotal').textContent = view.netTotalText;
+    host.appendChild(total);
+  }
+
+  /**
+   * 用途：畫出勤明細（值原樣顯示，後綴單位由決策物件帶來）；該月無出勤列時改顯示靜態說明。
+   * @param {Object} attend decidePayView() 的 pay.attend。
+   */
+  function renderAttend(attend) {
+    var host = el('attendRows');
+    clearNode(host);
+    el('attendEmpty').hidden = !attend.empty;
+    el('attendCard').hidden = attend.empty;
+    for (var i = 0; i < attend.items.length; i++) {
+      var row = fromTemplate('tplAttendRow');
+      slot(row, 'slotLabel').textContent = attend.items[i].label;
+      slot(row, 'slotValue').textContent = attend.items[i].value;
+      slot(row, 'slotUnit').textContent = attend.items[i].unit;
+      host.appendChild(row);
+    }
+  }
+
+  /**
+   * 用途：依決策物件渲染薪資／出勤兩頁。
+   * @param {Object} decision decidePayView() 的決策物件。
+   */
+  function renderPay(decision) {
+    el('payLoading').hidden = true;
+    if (decision.view === 'PAY_DATA') {
+      state.tab = L.markPayLoaded(state.tab, true);
+      state.payMonths = decision.pay.months;
+      state.payMonth = decision.pay.month;
+      renderMonthBar(decision.pay.monthOptions);
+      renderPayCards(decision.pay);
+      renderAttend(decision.pay.attend);
+      el('valPayMonth').textContent = decision.pay.month;
+      el('payMsgView').hidden = true;
+      el('payCards').hidden = false;
+      return;
+    }
+    if (decision.view === 'BIND_FORM') {
+      // 尚未配對：配對表單只在特休頁，切回特休頁完成配對（不在沒有表單的頁面叫人輸入）
+      state.tab = L.selectTab(state.tab, L.TAB_LEAVE).state;
+      renderTabs();
+      render(decision);
+      return;
+    }
+    showPayMessage(decision);
   }
 
   /**
@@ -274,7 +604,7 @@
   /**
    * 用途：以 text/plain 簡單請求 POST 後端（避開跨來源預檢）；
    *       任何連線或解析失敗一律轉成前端狀況碼物件，交由決策函式處理。
-   * @param {string} action 'query' 或 'bind'。
+   * @param {string} action 'query'、'bind' 或 'query_pay'。
    * @param {Object} params 其餘參數。
    * @return {Promise<Object>} 後端回應或前端狀況碼物件。
    */
@@ -308,6 +638,18 @@
   }
 
   /**
+   * 用途：查詢本人某月薪資與出勤並渲染兩頁（空字串月份＝由後端取最新月）。
+   * @param {string} month 月份。
+   * @return {Promise} 完成。
+   */
+  function queryPay(month) {
+    showPayLoading();
+    return postApi('query_pay', { idToken: state.idToken, month: month }).then(function (resp) {
+      renderPay(L.decidePayView(resp, state.errorsTable, Date.now()));
+    });
+  }
+
+  /**
    * 用途：送出配對；成功後直接重查，讓使用者馬上看到四欄。
    * @param {Event} evt 表單送出事件。
    */
@@ -329,18 +671,42 @@
   }
 
   /**
+   * 用途：文案表載不到時的兜底——收起全部功能區塊，只留靜態備援說明（此處不組任何文字）。
+   */
+  function showBootFail() {
+    showView('none');
+    el('tabs').hidden = true;
+    el('payTop').hidden = true;
+    el('payFoot').hidden = true;
+    el('tabPay').hidden = true;
+    el('tabAttend').hidden = true;
+    el('bootFail').hidden = false;
+  }
+
+  /**
    * 用途：流程進入點。文案表→LIFF→憑證→查詢，任一步失敗都轉成可讀訊息。
+   *       初始化只在此做一次；之後切頁籤、換月份都不會再走這條路徑。
    */
   function start() {
     el('btnReload').addEventListener('click', query);
     el('btnRetry').addEventListener('click', query);
     el('bindForm').addEventListener('submit', onBindSubmit);
+    el('btnPayRetry').addEventListener('click', onPayRetry);
+    var tabButtons = document.querySelectorAll('#tabs button');
+    for (var i = 0; i < tabButtons.length; i++) {
+      tabButtons[i].addEventListener('click', onTabClick);
+    }
+    renderTabs();
 
-    loadErrors().then(initLiff).then(readIdToken).then(query).catch(function (reason) {
+    loadErrors().then(initLiff).then(readIdToken).then(function () {
+      // 憑證到手才開放薪資單／出勤兩個頁籤，避免在還沒登入時就送出查不到結果的請求
+      el('tabBtnPay').disabled = false;
+      el('tabBtnAttend').disabled = false;
+      return query();
+    }).catch(function (reason) {
       if (!state.errorsTable) {
-        // 文案表都沒載到，只能亮靜態備援段（此處不組任何文字）
-        showView('none');
-        el('bootFail').hidden = false;
+        // 文案表都沒載到，只能亮靜態備援段
+        showBootFail();
         return;
       }
       var code = (typeof reason === 'string') ? reason : 'UNKNOWN';
