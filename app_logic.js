@@ -128,6 +128,15 @@
   /** 薪資明細的零值判定值：後端金額一律整數字串，值恰為此者即該項無發放。 */
   var PAY_ZERO_TEXT = '0';
 
+  /** 薪資明細的空值判定值：非金額欄（如薪別）在來源可能無值，後端以空字串原樣透傳（契約 PAY-1.0.1）。 */
+  var PAY_EMPTY_TEXT = '';
+
+  /**
+   * 薪資明細的隱藏值集合（判定以「值」為準，不看欄名——薪別不是金額，不得被當成金額判讀）：
+   * "0"＝該項無發放；""＝該欄來源無值。兩者一律不列在卡片上，避免版面被無意義的列灌滿。
+   */
+  var PAY_HIDDEN_VALUES = [PAY_ZERO_TEXT, PAY_EMPTY_TEXT];
+
   /**
    * 金額字串樣態（可選負號＋整數）。**一律以 [0-9] 明寫、禁用 \d**——
    * Y-P1 實測教訓：\d 在部分執行環境會收下全形數字，令 numeric-string 契約被穿透。
@@ -542,8 +551,18 @@
   }
 
   /**
-   * 用途：把各公司的 21 項明細組成卡片資料——值恰為 "0" 者隱藏（該項無發放），
-   *       其餘以千分位顯示；整張卡片全被隱藏時標記 empty，由畫面顯示「本月無發放明細」。
+   * 用途：判定薪資明細某一項是否隱藏——以「值集合」判定（"0" 或空字串），不看欄名。
+   * @param {string} value 明細值。
+   * @return {boolean} true＝隱藏。
+   */
+  function isHiddenPayValue(value) {
+    return PAY_HIDDEN_VALUES.indexOf(value) >= 0;
+  }
+
+  /**
+   * 用途：把各公司的 21 項明細組成卡片資料——值恰為 "0"（該項無發放）或空字串
+   *       （該欄來源無值，例：薪別）者隱藏，其餘以千分位顯示；整張卡片全被隱藏時標記 empty，
+   *       由畫面顯示「本月無發放明細」。空的薪別本身不構成「有發放」，因為判定看的是值不是欄名。
    *       公司名稱與順序一律照後端給的，前端不寫死任何公司清單。
    * @param {*} companies query_pay 回傳的 companies 陣列。
    * @return {Array<{company:string, items:Array, empty:boolean}>|null} 卡片資料；不合格回 null。
@@ -560,7 +579,7 @@
       if (pairs === null) { return null; }
       var visible = [];
       for (var j = 0; j < pairs.length; j++) {
-        if (pairs[j].value === PAY_ZERO_TEXT) { continue; }
+        if (isHiddenPayValue(pairs[j].value)) { continue; }
         visible.push({ label: pairs[j].label, value: formatThousands(pairs[j].value) });
       }
       cards.push({ company: entry.company, items: visible, empty: visible.length === 0 });
@@ -748,6 +767,8 @@
     PAY_ITEM_COUNT: PAY_ITEM_COUNT,
     ATTEND_ITEM_COUNT: ATTEND_ITEM_COUNT,
     PAY_ZERO_TEXT: PAY_ZERO_TEXT,
+    PAY_HIDDEN_VALUES: PAY_HIDDEN_VALUES.slice(),
+    isHiddenPayValue: isHiddenPayValue,
     PAY_CONFIG_KEY: PAY_CONFIG_KEY,
     PAY_CONFIG_FIELDS: PAY_CONFIG_FIELDS.slice(),
     createTabState: createTabState,
