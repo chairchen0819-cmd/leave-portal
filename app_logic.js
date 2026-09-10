@@ -32,7 +32,7 @@
   // ===== 常數 =====
 
   /** 本檔版本；與 errors.json 的 schemaVersion 各自獨立。 */
-  var VERSION = 'Y3-1.0.0';
+  var VERSION = 'Y3-1.1.0';
 
   /** 未知狀況的 fallback 文案鍵。 */
   var FALLBACK_KEY = 'UNKNOWN';
@@ -111,6 +111,13 @@
 
   /** 頁籤順序＝畫面上的左至右順序；第一個即預設頁籤。 */
   var TABS = [TAB_LEAVE, TAB_PAY, TAB_ATTEND];
+
+  /**
+   * 三期（Y-P7）直達頁籤：LIFF 網址查詢參數名。
+   * 圖文選單每鍵各帶 ?tab=leave|pay|attend，開頁即停在該頁籤；缺參數或值不合法一律回到特休頁。
+   * 讀取時機必須在 SDK 初始化完成之後——轉址期間參數被 SDK 暫存，初始化前讀到的是空值。
+   */
+  var TAB_PARAM = 'tab';
 
   /**
    * query_pay 成功回應之 data 鍵集合（恰五鍵）。
@@ -457,6 +464,45 @@
     return { active: current.active, payLoaded: loaded === true };
   }
 
+  // ===== 三期（Y-P7）直達頁籤（純函式；不碰 DOM、不碰 liff 物件）=====
+
+  /**
+   * 用途：把查詢字串拆成鍵值表（只取第一個同名鍵；解碼失敗的值以原文保留，不丟例外）。
+   * @param {string} search 查詢字串，可含開頭的 ? 或 #。
+   * @return {Object} 鍵值表。
+   */
+  function parseQuery(search) {
+    var table = {};
+    if (typeof search !== 'string' || search === '') { return table; }
+    var text = search.replace(/^[?#]/, '');
+    var parts = text.split('&');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === '') { continue; }
+      var at = parts[i].indexOf('=');
+      var key = at < 0 ? parts[i] : parts[i].slice(0, at);
+      var value = at < 0 ? '' : parts[i].slice(at + 1);
+      try { key = decodeURIComponent(key); } catch (keyError) { /* 保留原文 */ }
+      try { value = decodeURIComponent(value.replace(/\+/g, ' ')); } catch (valueError) { /* 保留原文 */ }
+      if (!Object.prototype.hasOwnProperty.call(table, key)) { table[key] = value; }
+    }
+    return table;
+  }
+
+  /**
+   * 用途：由開頁網址的查詢字串決定初始頁籤。
+   *       規則：tab 參數值（去空白、轉小寫）在 TABS 內即採用；否則回到預設頁籤（特休）。
+   *       未知值一律靜默回預設，不顯示任何訊息——網址是選單設定的，不是使用者打的，沒有人需要被糾正。
+   *       本函式不讀 SDK 轉址暫存參數：呼叫端負責在 SDK 初始化完成後才傳入還原後的查詢字串。
+   * @param {string} search window.location.search（須於 SDK 初始化完成後讀取）。
+   * @return {string} 頁籤代號。
+   */
+  function resolveInitialTab(search) {
+    var raw = parseQuery(search)[TAB_PARAM];
+    if (typeof raw !== 'string') { return TABS[0]; }
+    var wanted = raw.trim().toLowerCase();
+    return TABS.indexOf(wanted) >= 0 ? wanted : TABS[0];
+  }
+
   // ===== 二期（Y-P3）薪資／出勤視圖組裝（純函式）=====
 
   /**
@@ -771,6 +817,8 @@
     isHiddenPayValue: isHiddenPayValue,
     PAY_CONFIG_KEY: PAY_CONFIG_KEY,
     PAY_CONFIG_FIELDS: PAY_CONFIG_FIELDS.slice(),
+    TAB_PARAM: TAB_PARAM,
+    resolveInitialTab: resolveInitialTab,
     createTabState: createTabState,
     selectTab: selectTab,
     markPayLoaded: markPayLoaded,

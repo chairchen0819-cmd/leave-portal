@@ -6,6 +6,12 @@
         尚未配對者顯示配對表單，配對成功後自動重查。
         畫面分三個頁籤：特休（一期功能，內容與文案未改）／薪資單／出勤。
 
+  三期（Y-P7，2026-09-05）直達頁籤：
+    LINE 圖文選單每鍵各帶一個 LIFF 網址參數 ?tab=leave|pay|attend，開頁即停在該頁籤
+    （特休／薪資單／出勤各一鍵）。同一個 LIFF ID、同一個部署點，後端與雲端資料零改動。
+    參數在 liff.init() 完成後才讀（LIFF 轉址期間參數暫存於 liff.state）；缺參數或值不合法
+    一律回到特休頁，現有單鍵選單行為不變。
+
   部署前必做（唯一需要修改的地方＝下方 CONFIG 兩個常數）：
     1. CONFIG.LIFF_ID  ← LINE Developers 主控台上的 LIFF ID
     2. CONFIG.GAS_URL  ← Apps Script 部署後的 /exec 網址
@@ -412,6 +418,17 @@
   }
 
   /**
+   * 用途：三期直達頁籤——依開頁網址的 tab 參數決定初始頁籤並立即切顯示。
+   *       必須在 liff.init() 完成後呼叫（init 前 location.search 仍是 liff.state 暫存型態）。
+   *       此處只切畫面，不發任何查詢；薪資查詢由 start() 在憑證到手後統一發出。
+   */
+  function applyInitialTab() {
+    state.tab = L.selectTab(state.tab, L.resolveInitialTab(window.location.search)).state;
+    renderTabs();
+    if (L.isPayTab(state.tab.active)) { showPayLoading(); }
+  }
+
+  /**
    * 用途：頁籤鈕點擊。只切顯示；僅在薪資資料尚未載入時才發出一次查詢，
    *       不重跑 LIFF 初始化、不重取登入憑證、不重查已在畫面上的資料。
    * @param {Event} evt 點擊事件。
@@ -699,10 +716,12 @@
     }
     renderTabs();
 
-    loadErrors().then(initLiff).then(readIdToken).then(function () {
+    loadErrors().then(initLiff).then(applyInitialTab).then(readIdToken).then(function () {
       // 憑證到手才開放薪資單／出勤兩個頁籤，避免在還沒登入時就送出查不到結果的請求
       el('tabBtnPay').disabled = false;
       el('tabBtnAttend').disabled = false;
+      // 三期直達頁籤：從選單直接進薪資單／出勤時，薪資查詢與特休查詢並行發出（各自渲染各自的頁）
+      if (L.isPayTab(state.tab.active) && !state.tab.payLoaded) { queryPay(''); }
       return query();
     }).catch(function (reason) {
       if (!state.errorsTable) {
