@@ -6,6 +6,12 @@
         尚未配對者顯示配對表單，配對成功後自動重查。
         畫面分三個頁籤：特休（一期功能，內容與文案未改）／薪資單／出勤。
 
+  三期（Y-P9，2026-09-05，Chair 裁 A 案）薪資卡加減分組：
+    每張公司卡分「加項」「減項」兩群（減項紅字括號），下方小計區列應稅／免稅／減項(紅)／實發，
+    最後一行算式「應稅＋免稅－減項＝實發」由文案表模板填入後端四個數字（前端零金額運算）。
+    哪些欄屬加項／減項不靠欄名猜，來自 work_pay\y8\audit_pay_groups.py 對真實資料的實證，
+    寫在 errors.json 的 payView.payGroups（改字不動程式）。薪別移到卡片提示行。
+
   三期（Y-P7，2026-09-05）直達頁籤：
     LINE 圖文選單每鍵各帶一個 LIFF 網址參數 ?tab=leave|pay|attend，開頁即停在該頁籤
     （特休／薪資單／出勤各一鍵）。同一個 LIFF ID、同一個部署點，後端與雲端資料零改動。
@@ -67,6 +73,7 @@
     --text: #1f2d3d;
     --sub: #5c6b7a;
     --accent: #2f6f4f;
+    --minus: #b3261e;   /* 減項紅：與主色綠對比、深到白底可讀 */
   }
   * { box-sizing: border-box; }
   body {
@@ -173,6 +180,14 @@
   .prow dt { color: var(--sub); font-size: 15px; margin: 0; }
   .prow dd { margin: 0; font-size: 18px; font-weight: 700; text-align: right; }
   .totalLine { margin: 0; font-size: 20px; font-weight: 700; }
+  /* ===== 三期（Y-P9）薪資卡加減分組：群標籤／減項紅字括號／小計區淺底／實發粗線／算式行 ===== */
+  .grp { margin: 10px 0 0; font-size: 13px; color: var(--sub); letter-spacing: 0.05em; }
+  .minus dd { color: var(--minus); }
+  .sub { background: #f7f9fb; margin: 8px -14px 0; padding: 6px 14px 2px; }
+  .sub .prow dt { color: var(--text); }
+  .net { border-top: 2px solid var(--text); }
+  .net dd { font-size: 20px; }
+  .formula { margin: 8px 0 0; color: var(--sub); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -268,13 +283,25 @@
   <template id="tplPayCard">
     <section class="pcard">
       <h2 class="slotTitle"></h2>
-      <p class="note">本表僅列 <span class="slotCompany"></span> 發放部分</p>
+      <p class="note">本表僅列 <span class="slotCompany"></span> 發放部分<span class="slotPayTypeWrap" hidden>　薪別：<span class="slotPayType"></span></span></p>
+      <!-- 三期（Y-P9）：加項／減項分組，減項紅字括號；小計三列與實發恆顯；算式行由文案表模板填值 -->
+      <p class="grp slotAddHead">加項</p>
       <dl class="prows slotRows"></dl>
+      <p class="grp slotDeductHead">減項</p>
+      <dl class="prows slotDeductRows"></dl>
+      <dl class="prows sub slotSubRows"></dl>
+      <p class="formula slotFormula"></p>
       <p class="hint slotEmpty" hidden>本月無發放明細</p>
     </section>
   </template>
   <template id="tplPayRow">
     <div class="prow"><dt class="slotLabel"></dt><dd class="slotValue"></dd></div>
+  </template>
+  <template id="tplPayDeductRow">
+    <div class="prow minus"><dt class="slotLabel"></dt><dd class="slotValue"></dd></div>
+  </template>
+  <template id="tplPayNetRow">
+    <div class="prow net"><dt class="slotLabel"></dt><dd class="slotValue"></dd></div>
   </template>
   <template id="tplTotalCard">
     <section class="pcard"><p class="totalLine">實發合計 <span class="slotTotal"></span> 元</p></section>
@@ -515,18 +542,45 @@
       slot(node, 'slotTitle').textContent = card.company;
       slot(node, 'slotCompany').textContent = card.company;
       slot(node, 'slotEmpty').hidden = !card.empty;
-      var rows = slot(node, 'slotRows');
-      for (var j = 0; j < card.items.length; j++) {
-        var row = fromTemplate('tplPayRow');
-        slot(row, 'slotLabel').textContent = card.items[j].label;
-        slot(row, 'slotValue').textContent = card.items[j].value;
-        rows.appendChild(row);
+      // 三期（Y-P9）：分組渲染——加項、減項（紅字括號）、小計區、算式行；全零卡只留「本月無發放明細」
+      var g = card.groups;
+      slot(node, 'slotPayTypeWrap').hidden = (g.payType === '');
+      slot(node, 'slotPayType').textContent = g.payType;
+      slot(node, 'slotAddHead').hidden = (g.add.length === 0);
+      appendPayRows(slot(node, 'slotRows'), g.add, plainRow);
+      slot(node, 'slotDeductHead').hidden = (g.deduct.length === 0);
+      appendPayRows(slot(node, 'slotDeductRows'), g.deduct, deductRow);
+      var subRows = slot(node, 'slotSubRows');
+      subRows.hidden = card.empty;
+      for (var j = 0; j < g.subtotals.length; j++) {
+        appendPayRows(subRows, [g.subtotals[j]], g.subtotals[j].deduct ? deductRow : plainRow);
       }
+      appendPayRows(subRows, [g.net], netRow);
+      slot(node, 'slotFormula').textContent = g.formula;
+      slot(node, 'slotFormula').hidden = card.empty;
       host.appendChild(node);
     }
     var total = fromTemplate('tplTotalCard');
     slot(total, 'slotTotal').textContent = view.netTotalText;
     host.appendChild(total);
+  }
+
+  /**
+   * 用途：把一組 {label, value} 列依指定版型複製後掛到容器（三期：加項／減項／小計／實發共用）。
+   * @param {Element} host 容器。
+   * @param {Array<{label:string,value:string}>} rows 列資料。
+   * @param {function():Element} makeRow 版型複製函式（三個版型各一，版型 id 以常值寫死供靜態檢核對照）。
+   */
+  function plainRow() { return fromTemplate('tplPayRow'); }          // 加項與一般小計列
+  function deductRow() { return fromTemplate('tplPayDeductRow'); }   // 減項列（紅字括號）
+  function netRow() { return fromTemplate('tplPayNetRow'); }         // 實發列（粗上框線）
+  function appendPayRows(host, rows, makeRow) {
+    for (var i = 0; i < rows.length; i++) {
+      var row = makeRow();
+      slot(row, 'slotLabel').textContent = rows[i].label;
+      slot(row, 'slotValue').textContent = rows[i].value;
+      host.appendChild(row);
+    }
   }
 
   /**

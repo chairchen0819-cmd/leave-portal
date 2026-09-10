@@ -32,7 +32,7 @@
   // ===== 常數 =====
 
   /** 本檔版本；與 errors.json 的 schemaVersion 各自獨立。 */
-  var VERSION = 'Y3-1.1.0';
+  var VERSION = 'Y3-1.2.0';
 
   /** 未知狀況的 fallback 文案鍵。 */
   var FALLBACK_KEY = 'UNKNOWN';
@@ -156,6 +156,21 @@
   /** errors.json 中薪資／出勤顯示設定的區塊名稱與必填字串欄位。 */
   var PAY_CONFIG_KEY = 'payView';
   var PAY_CONFIG_FIELDS = ['rateField', 'countMarker', 'unitRate', 'unitCount', 'unitHours'];
+
+  /**
+   * 三期（Y-P9）薪資卡加減分組設定：位於 payView.payGroups，欄名一律來自設定（本檔零寫死欄名）。
+   * 分組依據＝work_pay\y8\audit_pay_groups.py 對真實資料之實證（2026-09-05，四檔恆等式全成立）。
+   *   addFields／deductFields／subtotalFields／formulaFields：欄名清單；
+   *   netField／payTypeField／deductSubtotalField：單一欄名；formulaTemplate：算式文案，{0}..{n} 對應 formulaFields。
+   * 五群（加項、減項、小計、實發、薪別）必須兩兩不重疊且聯集恰為 PAY_ITEM_COUNT 個欄名——少一欄或多一欄皆判設定不合格。
+   */
+  var PAY_GROUP_KEY = 'payGroups';
+  var PAY_GROUP_LIST_FIELDS = ['addFields', 'deductFields', 'subtotalFields', 'formulaFields'];
+  var PAY_GROUP_TEXT_FIELDS = ['deductSubtotalField', 'netField', 'payTypeField', 'formulaTemplate'];
+
+  /** 減項金額的顯示包裝（會計慣例：括號＝扣除）。 */
+  var PAY_DEDUCT_OPEN = '(';
+  var PAY_DEDUCT_CLOSE = ')';
 
   // ===== 顯示層格式化（純函式）=====
 
@@ -573,7 +588,52 @@
       always.push(raw.alwaysShowFields[j]);
     }
     config.alwaysShowFields = always;
+    var groups = readPayGroups(raw[PAY_GROUP_KEY]);
+    if (groups === null) { return { ok: false, config: null }; }
+    config.groups = groups;
     return { ok: true, config: config };
+  }
+
+  /**
+   * 用途：讀取並驗證薪資卡加減分組設定（三期 Y-P9）。任一條件不符即回 null，由呼叫端落 fallback。
+   *       驗證：四個清單皆為非空字串陣列；四個文字欄皆為非空字串；
+   *       加項／減項／小計／實發／薪別五群兩兩不重疊且聯集恰為 PAY_ITEM_COUNT 個欄名；
+   *       deductSubtotalField 在 subtotalFields 內；formulaFields 皆在小計或實發內；
+   *       formulaTemplate 含每一個 {i} 佔位。
+   * @param {*} raw payView.payGroups 原始物件。
+   * @return {Object|null} 正規化後的分組設定。
+   */
+  function readPayGroups(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { return null; }
+    var groups = {};
+    var i, j;
+    for (i = 0; i < PAY_GROUP_LIST_FIELDS.length; i++) {
+      var list = raw[PAY_GROUP_LIST_FIELDS[i]];
+      if (!Array.isArray(list) || list.length === 0) { return null; }
+      var copy = [];
+      for (j = 0; j < list.length; j++) {
+        if (typeof list[j] !== 'string' || list[j] === '') { return null; }
+        copy.push(list[j]);
+      }
+      groups[PAY_GROUP_LIST_FIELDS[i]] = copy;
+    }
+    for (i = 0; i < PAY_GROUP_TEXT_FIELDS.length; i++) {
+      var text = raw[PAY_GROUP_TEXT_FIELDS[i]];
+      if (typeof text !== 'string' || text === '') { return null; }
+      groups[PAY_GROUP_TEXT_FIELDS[i]] = text;
+    }
+    var all = groups.addFields.concat(groups.deductFields, groups.subtotalFields, [groups.netField, groups.payTypeField]);
+    if (all.length !== PAY_ITEM_COUNT) { return null; }
+    for (i = 0; i < all.length; i++) {
+      if (all.indexOf(all[i]) !== i) { return null; }   // 重複＝同一欄被分到兩群
+    }
+    if (groups.subtotalFields.indexOf(groups.deductSubtotalField) < 0) { return null; }
+    for (i = 0; i < groups.formulaFields.length; i++) {
+      var name = groups.formulaFields[i];
+      if (groups.subtotalFields.indexOf(name) < 0 && name !== groups.netField) { return null; }
+      if (groups.formulaTemplate.indexOf('{' + i + '}') < 0) { return null; }
+    }
+    return groups;
   }
 
   /**
@@ -606,6 +666,61 @@
   }
 
   /**
+   * 用途：把一家公司的 21 對明細依設定分成加項／減項／小計／實發／薪別（三期 Y-P9，A 案）。
+   *       規則：加項與減項沿用隱藏規則（"0" 與空字串不列）、順序照後端原序；減項值以括號包裝；
+   *       小計三列與實發恆顯（即使為 0，算式才完整）；算式文案由 formulaTemplate 帶入四個已格式化的值，
+   *       **本函式不做任何金額運算**（不加不減不比較大小），只做分組、排序、格式化與字串填空。
+   *       任一標籤不在任何一群、或設定要求的欄名不在明細內＝契約與設定漂移，回 null（整筆判不合格）。
+   * @param {Array<{label:string,value:string}>} pairs readItemPairs 的結果。
+   * @param {Object} groups readPayGroups 的結果。
+   * @return {Object|null} {payType, add, deduct, subtotals, net, formula, empty}。
+   */
+  function groupPayCard(pairs, groups) {
+    var index = {};
+    var i;
+    for (i = 0; i < pairs.length; i++) {
+      var label = pairs[i].label;
+      var known = groups.addFields.indexOf(label) >= 0 || groups.deductFields.indexOf(label) >= 0
+        || groups.subtotalFields.indexOf(label) >= 0 || label === groups.netField || label === groups.payTypeField;
+      if (!known) { return null; }
+      index[label] = pairs[i].value;
+    }
+    var required = groups.subtotalFields.concat(groups.formulaFields, [groups.netField, groups.payTypeField]);
+    for (i = 0; i < required.length; i++) {
+      if (typeof index[required[i]] !== 'string') { return null; }
+    }
+    var add = [], deduct = [];
+    for (i = 0; i < pairs.length; i++) {
+      if (isHiddenPayValue(pairs[i].value)) { continue; }
+      if (groups.addFields.indexOf(pairs[i].label) >= 0) {
+        add.push({ label: pairs[i].label, value: formatThousands(pairs[i].value) });
+      } else if (groups.deductFields.indexOf(pairs[i].label) >= 0) {
+        deduct.push({ label: pairs[i].label, value: PAY_DEDUCT_OPEN + formatThousands(pairs[i].value) + PAY_DEDUCT_CLOSE });
+      }
+    }
+    var subtotals = [];
+    for (i = 0; i < groups.subtotalFields.length; i++) {
+      var name = groups.subtotalFields[i];
+      var isDeduct = (name === groups.deductSubtotalField);
+      var shown = formatThousands(index[name]);
+      subtotals.push({ label: name, value: isDeduct ? PAY_DEDUCT_OPEN + shown + PAY_DEDUCT_CLOSE : shown, deduct: isDeduct });
+    }
+    var vars = {};
+    for (i = 0; i < groups.formulaFields.length; i++) {
+      vars[String(i)] = formatThousands(index[groups.formulaFields[i]]);
+    }
+    return {
+      payType: index[groups.payTypeField],
+      add: add,
+      deduct: deduct,
+      subtotals: subtotals,
+      net: { label: groups.netField, value: formatThousands(index[groups.netField]) },
+      formula: fillTemplate(groups.formulaTemplate, vars),
+      empty: add.length === 0 && deduct.length === 0
+    };
+  }
+
+  /**
    * 用途：把各公司的 21 項明細組成卡片資料——值恰為 "0"（該項無發放）或空字串
    *       （該欄來源無值，例：薪別）者隱藏，其餘以千分位顯示；整張卡片全被隱藏時標記 empty，
    *       由畫面顯示「本月無發放明細」。空的薪別本身不構成「有發放」，因為判定看的是值不是欄名。
@@ -613,7 +728,7 @@
    * @param {*} companies query_pay 回傳的 companies 陣列。
    * @return {Array<{company:string, items:Array, empty:boolean}>|null} 卡片資料；不合格回 null。
    */
-  function buildPayCards(companies) {
+  function buildPayCards(companies, groups) {
     if (!Array.isArray(companies) || companies.length === 0) { return null; }
     var cards = [];
     for (var i = 0; i < companies.length; i++) {
@@ -628,7 +743,13 @@
         if (isHiddenPayValue(pairs[j].value)) { continue; }
         visible.push({ label: pairs[j].label, value: formatThousands(pairs[j].value) });
       }
-      cards.push({ company: entry.company, items: visible, empty: visible.length === 0 });
+      var card = { company: entry.company, items: visible, empty: visible.length === 0 };
+      if (groups) {
+        // 三期：加減分組（設定缺席時維持一期／二期的平鋪結果，供既有檢核與回復路徑使用）
+        card.groups = groupPayCard(pairs, groups);
+        if (card.groups === null) { return null; }
+      }
+      cards.push(card);
     }
     return cards;
   }
@@ -693,7 +814,7 @@
     if (!isMonthsDesc(data.months)) { return fail; }
     if (typeof data.month !== 'string' || data.months.indexOf(data.month) < 0) { return fail; }
     if (typeof data.net_total !== 'string' || !AMOUNT_TEXT_PATTERN.test(data.net_total)) { return fail; }
-    var cards = buildPayCards(data.companies);
+    var cards = buildPayCards(data.companies, config.groups);
     if (cards === null) { return fail; }
     var attendView = buildAttendItems(data.attend, config);
     if (!attendView.ok) { return fail; }
@@ -827,6 +948,11 @@
     buildMonthOptions: buildMonthOptions,
     pickMonth: pickMonth,
     readPayConfig: readPayConfig,
+    PAY_GROUP_KEY: PAY_GROUP_KEY,
+    PAY_GROUP_LIST_FIELDS: PAY_GROUP_LIST_FIELDS.slice(),
+    PAY_GROUP_TEXT_FIELDS: PAY_GROUP_TEXT_FIELDS.slice(),
+    readPayGroups: readPayGroups,
+    groupPayCard: groupPayCard,
     buildPayCards: buildPayCards,
     buildAttendItems: buildAttendItems,
     formatPayView: formatPayView,

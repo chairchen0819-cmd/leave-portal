@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "Y3-1.0.0",
+  "schemaVersion": "Y3-1.2.0",
   "fallbackKey": "UNKNOWN",
   "payView": {
     "alwaysShowFields": ["正工日", "出勤率"],
@@ -7,7 +7,17 @@
     "countMarker": "次",
     "unitRate": "%",
     "unitCount": "次",
-    "unitHours": "時"
+    "unitHours": "時",
+    "payGroups": {
+      "addFields": ["底薪", "技術津貼", "職務加給", "全勤獎金", "其他獎金", "伙食津貼", "加班費", "獎金", "績效獎金"],
+      "deductFields": ["勞保費", "健保費", "勞退自提", "不足", "其他扣款", "借支", "代墊費用"],
+      "subtotalFields": ["應稅金額", "免稅金額", "減項金額"],
+      "deductSubtotalField": "減項金額",
+      "netField": "實發工資",
+      "payTypeField": "薪別",
+      "formulaFields": ["應稅金額", "免稅金額", "減項金額", "實發工資"],
+      "formulaTemplate": "應稅 {0} ＋ 免稅 {1} － 減項 {2} ＝ 實發 {3}"
+    }
   },
   "messages": {
     "INVALID_TOKEN": "您的登入資訊已經逾時，或這個頁面開著太久了，所以無法確認是本人查詢。請先關閉這一頁，回到選單重新點一次特休查詢；若重開後仍看到這段話，請聯絡人資協助確認。",
